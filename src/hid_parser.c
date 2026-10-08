@@ -18,6 +18,7 @@
 
 /* Usage pages */
 #define PAGE_GENERIC        0x01
+#define PAGE_KEY            0x07
 #define PAGE_BUTTON         0x09
 #define PAGE_CONSUMER       0x0C
 
@@ -41,8 +42,15 @@ static void set_field(HidField *f, unsigned short bitOffset, unsigned char bitSi
 	f->reportId = reportId;
 }
 
-void hid_parse_mouse(const unsigned char *desc, unsigned short len, MouseLayout *out)
+/* Shared descriptor walker. Any of the outputs may be NULL; mouse/keyboard/
+ * consumer layouts are extracted independently from the same pass. */
+static void parse_descriptor(const unsigned char *desc, unsigned short len, MouseLayout *out,
+			     KeyLayout *kb, ConsumerLayout *cc)
 {
+	MouseLayout scratch;
+	unsigned char kbClaimed = 0; /* keyboard report id picked (first keyboard block wins) */
+	unsigned char kbId = 0;
+
 	unsigned short i;
 	unsigned char usagePage = 0;
 	unsigned long reportSize = 0;
@@ -56,10 +64,18 @@ void hid_parse_mouse(const unsigned char *desc, unsigned short len, MouseLayout 
 	unsigned long usageMin = 0;
 	unsigned char hasUsageMin = 0;
 
-	/* clear output */
+	/* clear outputs */
+	if (!out)
+		out = &scratch; /* result discarded */
 	{
 		unsigned char *p = (unsigned char *)out;
 		for (i = 0; i < sizeof(MouseLayout); i++)
+			p[i] = 0;
+		p = (unsigned char *)kb;
+		for (i = 0; kb && i < sizeof(KeyLayout); i++)
+			p[i] = 0;
+		p = (unsigned char *)cc;
+		for (i = 0; cc && i < sizeof(ConsumerLayout); i++)
 			p[i] = 0;
 	}
 
@@ -110,6 +126,40 @@ void hid_parse_mouse(const unsigned char *desc, unsigned short len, MouseLayout 
 			unsigned long span = reportSize * reportCount;
 			/* data bit0=0 -> data field (not constant padding) */
 			unsigned char isConst = (unsigned char)(data & 0x01);
+			unsigned char isVar = (unsigned char)((data >> 1) & 0x01);
+			if (!isConst && kb && usagePage == PAGE_KEY &&
+			    (!kbClaimed || kbId == reportId)) {
+				if (isVar && reportSize == 1 && reportCount == 8 && hasUsageMin &&
+				    usageMin == 0xE0 && !kb->hasMods) {
+					kb->hasMods = 1;
+					kb->modOffset = bitOffset;
+					kbClaimed = 1;
+					kbId = reportId;
+				} else if (!kb->valid && isVar && reportSize == 1 && reportCount > 8 &&
+					   hasUsageMin) {
+					kb->valid = 1;
+					kb->isBitmap = 1;
+					kb->keysOffset = bitOffset;
+					kb->keysCount = (unsigned short)reportCount;
+					kb->usageBase = (unsigned short)usageMin;
+					kbClaimed = 1;
+					kbId = reportId;
+				} else if (!kb->valid && !isVar && reportSize == 8 && reportCount) {
+					kb->valid = 1;
+					kb->keysOffset = bitOffset;
+					kb->keysCount = (unsigned short)reportCount;
+					kbClaimed = 1;
+					kbId = reportId;
+				}
+			}
+			if (!isConst && cc && !cc->valid && usagePage == PAGE_CONSUMER && !isVar &&
+			    (reportSize == 8 || reportSize == 16) && reportCount) {
+				cc->valid = 1;
+				cc->reportId = reportId;
+				cc->offset = bitOffset;
+				cc->size = (unsigned char)reportSize;
+				cc->count = (unsigned char)reportCount;
+			}
 			if (!isConst) {
 				if (usagePage == PAGE_BUTTON) {
 					set_field(&out->buttons, bitOffset,
@@ -154,8 +204,9 @@ void hid_parse_mouse(const unsigned char *desc, unsigned short len, MouseLayout 
 		}
 		case ITEM_OUTPUT:
 		case ITEM_FEATURE:
-			/* advance offset and reset locals like any main item */
-			bitOffset = (unsigned short)(bitOffset + reportSize * reportCount);
+			/* Output / Feature items have their own bit positions, they do not
+			 * shift the Input fields (ZMK's LED output sits before its key
+			 * array). Reset locals like any main item. */
 			localUsageCount = 0;
 			hasUsageMin = 0;
 			break;
@@ -165,6 +216,11 @@ void hid_parse_mouse(const unsigned char *desc, unsigned short len, MouseLayout 
 		i += size + 1;
 	}
 
+	if (kb) {
+		kb->reportId = kbId;
+		if (!kb->valid)
+			kb->hasMods = 0;
+	}
 	out->hasReportId = hasReportId;
 	/* The mouse report is the one carrying X. Drop fields from other reports. */
 	if (out->x.valid) {
@@ -178,6 +234,17 @@ void hid_parse_mouse(const unsigned char *desc, unsigned short len, MouseLayout 
 		if (out->hwheel.valid && out->hwheel.reportId != out->mouseReportId)
 			out->hwheel.valid = 0;
 	}
+}
+
+void hid_parse_mouse(const unsigned char *desc, unsigned short len, MouseLayout *out)
+{
+	parse_descriptor(desc, len, out, 0, 0);
+}
+
+void hid_parse_keys(const unsigned char *desc, unsigned short len, KeyLayout *kb,
+		    ConsumerLayout *cc)
+{
+	parse_descriptor(desc, len, 0, kb, cc);
 }
 
 /* Read nbits (<=32) as unsigned, little-endian bit order matching HID. */

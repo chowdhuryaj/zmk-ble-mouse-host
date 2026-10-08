@@ -7,6 +7,7 @@
  */
 #include <stdio.h>
 #include <zmk_ble_mouse_host/hid_parser.h>
+#include "zmk_desc.h"
 
 static int failures = 0;
 
@@ -165,12 +166,48 @@ static void test_invalid(void)
 	}
 }
 
+static void test_zmk_device(void)
+{
+	MouseLayout m;
+	KeyLayout kb;
+	ConsumerLayout cc;
+
+	printf("test_zmk_device\n");
+	/* default build: 6KRO + basic consumer + mouse, all found in one descriptor */
+	hid_parse_mouse(zmk_desc_default, sizeof(zmk_desc_default), &m);
+	hid_parse_keys(zmk_desc_default, sizeof(zmk_desc_default), &kb, &cc);
+	CHECK(m.x.valid && m.mouseReportId == 3, "mouse is report 3");
+	CHECK(m.buttons.bitOffset == 8 && m.buttons.bitSize == 5, "mouse buttons");
+	CHECK(m.x.bitOffset == 16 && m.y.bitOffset == 32, "mouse X/Y");
+	CHECK(m.wheel.bitOffset == 48 && m.hwheel.bitOffset == 64, "mouse wheel/pan after X/Y");
+	CHECK(kb.valid && kb.reportId == 1, "keyboard is report 1");
+	CHECK(kb.hasMods && kb.modOffset == 8, "modifiers at byte 1");
+	CHECK(!kb.isBitmap && kb.keysOffset == 24 && kb.keysCount == 6,
+	      "6 key slots after the reserved byte (LED output does not shift them)");
+	CHECK(cc.valid && cc.reportId == 2 && cc.offset == 8 && cc.size == 8 && cc.count == 6,
+	      "consumer: 6 x 8-bit in report 2");
+
+	hid_parse_mouse(zmk_desc_nkro_full, sizeof(zmk_desc_nkro_full), &m);
+	hid_parse_keys(zmk_desc_nkro_full, sizeof(zmk_desc_nkro_full), &kb, &cc);
+	CHECK(m.x.valid && m.mouseReportId == 3 && m.x.bitOffset == 16, "mouse unchanged");
+	CHECK(kb.valid && kb.reportId == 1 && kb.hasMods && kb.modOffset == 8, "NKRO keyboard");
+	CHECK(kb.isBitmap && kb.keysOffset == 24 && kb.keysCount == 104 && kb.usageBase == 0,
+	      "NKRO bitmap of 104 bits from usage 0");
+	CHECK(cc.valid && cc.reportId == 2 && cc.size == 16 && cc.count == 6,
+	      "consumer: 6 x 16-bit");
+
+	/* a plain mouse has neither */
+	hid_parse_keys(report_id_mouse, sizeof(report_id_mouse), &kb, &cc);
+	CHECK(!kb.valid && !kb.hasMods && !cc.valid, "mouse-only descriptor: no keyboard/consumer");
+}
+
 int main(void)
 {
 	test_boot_mouse();
 	test_report_id_mouse();
 	test_boundaries();
 	test_invalid();
+	test_zmk_device();
 	if (failures == 0) {
 		printf("\nALL TESTS PASSED\n");
 		return 0;

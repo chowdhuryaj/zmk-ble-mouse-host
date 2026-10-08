@@ -16,7 +16,12 @@
  * callback (root-caused with an RF sniffer to a TargetA address-type mismatch),
  * so don't switch this back to a scan-then-match. Initial/fresh pairing, where
  * the mouse's address isn't known yet, does scan, matched by HID appearance
- * (see scan_cb()).
+ * (see scan_cb()), or by advertised name when pair-name-prefix is set (needed for
+ * ZMK devices, which advertise the Keyboard appearance).
+ *
+ * With CONFIG_ZMK_BLE_MOUSE_HOST_FORWARD_KEYS the device's keyboard and consumer
+ * input reports are also decoded and raised as zmk_keycode_state_changed events
+ * (from the system workqueue), so a ZMK trackball keeps its key/media bindings.
  */
 
 #define DT_DRV_COMPAT zmk_ble_mouse_host
@@ -37,6 +42,10 @@
 #include <zmk/ble.h>
 #include <zmk/ble_mouse_host.h>
 #include <zmk_ble_mouse_host/hid_parser.h>
+#if IS_ENABLED(CONFIG_ZMK_BLE_MOUSE_HOST_FORWARD_KEYS)
+#include <zmk/events/keycode_state_changed.h>
+#include <zmk_ble_mouse_host/key_diff.h>
+#endif
 
 LOG_MODULE_REGISTER(ble_mouse_host, CONFIG_ZMK_BLE_MOUSE_HOST_LOG_LEVEL);
 
@@ -77,7 +86,10 @@ static uint16_t proto_handle;       /* Protocol Mode (write) */
 static uint16_t map_handle;         /* Report Map (read) */
 static uint16_t boot_mouse_handle;  /* Boot Mouse Input Report (notify) */
 static uint16_t report_handles[MAX_REPORTS];
+static uint16_t report_end[MAX_REPORTS]; /* last attribute handle of each report characteristic */
+static uint8_t report_ids[MAX_REPORTS];  /* from the Report Reference descriptor (0 = unknown) */
 static int n_reports;
+static int pending_end = -1; /* report whose report_end the next characteristic sets */
 static bool use_boot;
 
 static struct bt_gatt_discover_params disc;
@@ -118,11 +130,14 @@ SETTINGS_STATIC_HANDLER_DEFINE(mouse_host, "mouse_host", NULL, mh_settings_set, 
 
 /* ---- input injection (runs on a work queue, never in the BT RX thread) -- */
 
+enum rep_kind { REP_MOUSE, REP_KEYBOARD, REP_CONSUMER };
+
 struct raw_rep {
     uint16_t handle;
     uint8_t is_boot;
+    uint8_t kind; /* enum rep_kind */
     uint8_t len;
-    uint8_t buf[20];
+    uint8_t buf[32];
 };
 
 K_MSGQ_DEFINE(rep_q, sizeof(struct raw_rep), 16, 4);
@@ -173,6 +188,50 @@ static void release_all_buttons(void) {
     emit_motion(0, 0, 0, 0, 0);
 }
 
+#if IS_ENABLED(CONFIG_ZMK_BLE_MOUSE_HOST_FORWARD_KEYS)
+/* Keyboard / consumer forwarding. Layouts are parsed from the report map; the
+ * held sets are only touched from the system workqueue (rep_work_cb and
+ * release_keys_work), which is also where the events are raised. */
+static KeyLayout kb_layout;
+static ConsumerLayout cc_layout;
+static HeldSet kb_held, cc_held;
+
+static void emit_key(void *ctx, unsigned short page, unsigned short usage, unsigned char pressed) {
+    ARG_UNUSED(ctx);
+    raise_zmk_keycode_state_changed((struct zmk_keycode_state_changed){
+        .usage_page = page,
+        .keycode = usage,
+        .state = pressed,
+        .timestamp = k_uptime_get(),
+    });
+}
+
+static void forward_keys(const struct raw_rep *r) {
+    /* As for the mouse: notifications lack the report-id byte, the layouts' offsets
+     * include it. */
+    uint8_t buf[sizeof(r->buf) + 1];
+    uint8_t id = (r->kind == REP_KEYBOARD) ? kb_layout.reportId : cc_layout.reportId;
+    uint16_t n = 0;
+    if (id) {
+        buf[n++] = id;
+    }
+    memcpy(buf + n, r->buf, r->len);
+    n += r->len;
+    if (r->kind == REP_KEYBOARD) {
+        kd_keyboard(&kb_held, &kb_layout, buf, n, emit_key, NULL);
+    } else {
+        kd_consumer(&cc_held, &cc_layout, buf, n, emit_key, NULL);
+    }
+}
+
+static void release_keys_work_cb(struct k_work *work) {
+    ARG_UNUSED(work);
+    kd_release_all(&kb_held, KD_PAGE_KEYBOARD, emit_key, NULL);
+    kd_release_all(&cc_held, KD_PAGE_CONSUMER, emit_key, NULL);
+}
+static K_WORK_DEFINE(release_keys_work, release_keys_work_cb);
+#endif
+
 /* ---- HID report map parsing (generic; see zmk_ble_mouse_host/hid_parser.h) */
 
 static MouseLayout layout;
@@ -211,6 +270,12 @@ static uint16_t layout_report_len(const MouseLayout *l) {
  * derived field layout (hid_parser) when available; falls back to the fixed
  * boot layout ([buttons][int8 x][int8 y][int8 wheel]) otherwise. */
 static void parse_and_inject(const struct raw_rep *r) {
+#if IS_ENABLED(CONFIG_ZMK_BLE_MOUSE_HOST_FORWARD_KEYS)
+    if (r->kind != REP_MOUSE) {
+        forward_keys(r);
+        return;
+    }
+#endif
 #if IS_ENABLED(CONFIG_ZMK_BLE_MOUSE_HOST_LOG_REPORTS)
     /* Verbose per-report tracing (first 40 reports, then every 64th) plus a raw
      * hexdump. Off by default -- it floods the console while the mouse moves;
@@ -295,6 +360,32 @@ K_WORK_DEFINE(rep_work, rep_work_cb);
 
 /* ---- GATT notify ------------------------------------------------------- */
 
+/* Which decoder a notification on this handle goes to. Keyboard / consumer reports
+ * are told apart from the mouse by Report ID (Report Reference descriptor); anything
+ * else keeps the mouse path, which gates on report length. */
+static uint8_t report_kind(uint16_t handle) {
+#if IS_ENABLED(CONFIG_ZMK_BLE_MOUSE_HOST_FORWARD_KEYS)
+    for (int i = 0; i < n_reports; i++) {
+        if (report_handles[i] != handle) {
+            continue;
+        }
+        uint8_t id = report_ids[i];
+        /* Without report ids in the descriptor (id 0) only trust it when there is no mouse. */
+        if (id || !layout_valid) {
+            if (kb_layout.valid && id == kb_layout.reportId) {
+                return REP_KEYBOARD;
+            }
+            if (cc_layout.valid && id == cc_layout.reportId) {
+                return REP_CONSUMER;
+            }
+        }
+    }
+#else
+    ARG_UNUSED(handle);
+#endif
+    return REP_MOUSE;
+}
+
 static uint8_t notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_params *params,
                          const void *data, uint16_t length) {
     if (!data) {
@@ -306,10 +397,19 @@ static uint8_t notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_params *
     struct raw_rep r = {
         .handle = params->value_handle,
         .is_boot = (params->value_handle == boot_mouse_handle),
+        .kind = report_kind(params->value_handle),
         .len = MIN(length, sizeof(r.buf)),
     };
     memcpy(r.buf, data, r.len);
-    if (k_msgq_put(&rep_q, &r, K_NO_WAIT) == 0) {
+    int err = k_msgq_put(&rep_q, &r, K_NO_WAIT);
+    if (err && r.kind != REP_MOUSE) {
+        /* Key reports carry absolute state, so when the queue is full drop the oldest
+         * report rather than this one: losing the latest could leave a key stuck. */
+        struct raw_rep old;
+        k_msgq_get(&rep_q, &old, K_NO_WAIT);
+        err = k_msgq_put(&rep_q, &r, K_NO_WAIT);
+    }
+    if (err == 0) {
         k_work_submit(&rep_work);
     }
     return BT_GATT_ITER_CONTINUE;
@@ -332,6 +432,13 @@ static uint8_t read_map_cb(struct bt_conn *conn, uint8_t err,
     LOG_HEXDUMP_INF(report_map, report_map_len, "HID report map");
     hid_parse_mouse(report_map, report_map_len, &layout);
     layout_valid = layout.x.valid;
+#if IS_ENABLED(CONFIG_ZMK_BLE_MOUSE_HOST_FORWARD_KEYS)
+    hid_parse_keys(report_map, report_map_len, &kb_layout, &cc_layout);
+    LOG_INF("keys: keyboard=%s (rid %d, %s, mods=%s) consumer=%s (rid %d, %ux%u-bit)",
+            kb_layout.valid ? "y" : "n", kb_layout.reportId, kb_layout.isBitmap ? "bitmap" : "array",
+            kb_layout.hasMods ? "y" : "n", cc_layout.valid ? "y" : "n", cc_layout.reportId,
+            cc_layout.count, cc_layout.size);
+#endif
     if (layout_valid) {
         mouse_report_len = layout_report_len(&layout);
         LOG_INF("layout: rid=%d len=%uB X(off%u sz%u) Y(off%u sz%u) wheel=%s pan=%s btn(off%u n%u)",
@@ -383,6 +490,43 @@ static void do_subscribes(struct bt_conn *conn) {
             boot_mouse_handle ? "1" : "0");
 }
 
+#if IS_ENABLED(CONFIG_ZMK_BLE_MOUSE_HOST_FORWARD_KEYS)
+/* Read each notifying report characteristic's Report Reference descriptor
+ * [report id, type], one at a time, then go on to subscribe_phase(). */
+static struct bt_gatt_read_params ref_read;
+static int ref_idx;
+
+static void subscribe_phase(struct bt_conn *conn);
+
+static void read_next_ref(struct bt_conn *conn);
+
+static uint8_t ref_read_cb(struct bt_conn *conn, uint8_t err, struct bt_gatt_read_params *params,
+                           const void *data, uint16_t length) {
+    if (!err && data && length >= 2) {
+        report_ids[ref_idx] = ((const uint8_t *)data)[0];
+        LOG_INF("report char h%u: report id %u", report_handles[ref_idx], report_ids[ref_idx]);
+    }
+    ref_idx++;
+    read_next_ref(conn);
+    return BT_GATT_ITER_STOP;
+}
+
+static void read_next_ref(struct bt_conn *conn) {
+    for (; ref_idx < n_reports; ref_idx++) {
+        ref_read.func = ref_read_cb;
+        ref_read.handle_count = 0; /* read by UUID */
+        ref_read.by_uuid.start_handle = report_handles[ref_idx] + 1;
+        ref_read.by_uuid.end_handle = report_end[ref_idx];
+        ref_read.by_uuid.uuid = BT_UUID_HIDS_REPORT_REF;
+        if (ref_read.by_uuid.start_handle <= ref_read.by_uuid.end_handle &&
+            bt_gatt_read(conn, &ref_read) == 0) {
+            return; /* ref_read_cb continues the chain */
+        }
+    }
+    subscribe_phase(conn);
+}
+#endif
+
 /* Read & parse the report map FIRST, then subscribe (in read_map_cb). A GATT
  * read issued while subscribe CCC writes are in flight can fail or be starved,
  * which previously left us decoding reports with the wrong (boot) layout. */
@@ -407,10 +551,20 @@ static void subscribe_phase(struct bt_conn *conn) {
 
 static uint8_t disc_chrc_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,
                             struct bt_gatt_discover_params *params) {
+    /* The previous report characteristic ends right before this declaration. */
+    if (pending_end >= 0) {
+        report_end[pending_end] = attr ? attr->handle - 1 : svc_end;
+        pending_end = -1;
+    }
     if (!attr) {
         LOG_INF("HID characteristics: %d report(s), boot=%s, proto=%s, map=%s", n_reports,
                 boot_mouse_handle ? "y" : "n", proto_handle ? "y" : "n", map_handle ? "y" : "n");
+#if IS_ENABLED(CONFIG_ZMK_BLE_MOUSE_HOST_FORWARD_KEYS)
+        ref_idx = 0;
+        read_next_ref(conn);
+#else
         subscribe_phase(conn);
+#endif
         return BT_GATT_ITER_STOP;
     }
 
@@ -423,6 +577,8 @@ static uint8_t disc_chrc_cb(struct bt_conn *conn, const struct bt_gatt_attr *att
         boot_mouse_handle = c->value_handle;
     } else if (!bt_uuid_cmp(c->uuid, BT_UUID_HIDS_REPORT)) {
         if ((c->properties & BT_GATT_CHRC_NOTIFY) && n_reports < MAX_REPORTS) {
+            report_ids[n_reports] = 0;
+            pending_end = n_reports;
             report_handles[n_reports++] = c->value_handle;
         }
     }
@@ -481,6 +637,7 @@ static void start_discovery(struct bt_conn *conn) {
     disc_started = true;
 
     n_reports = 0;
+    pending_end = -1;
     proto_handle = map_handle = boot_mouse_handle = 0;
     /* Drop any layout parsed from a previous mouse. subscribe_phase() normally
      * clears this before re-reading the report map, but not if the (new) mouse
@@ -488,6 +645,10 @@ static void start_discovery(struct bt_conn *conn) {
      * decoding with the old mouse's layout instead of falling back to boot. */
     layout_valid = false;
     mouse_report_len = 0;
+#if IS_ENABLED(CONFIG_ZMK_BLE_MOUSE_HOST_FORWARD_KEYS)
+    kb_layout.valid = false;
+    cc_layout.valid = false;
+#endif
 
     disc.uuid = BT_UUID_HIDS;
     disc.func = disc_service_cb;
@@ -532,7 +693,7 @@ static void start_discovery(struct bt_conn *conn) {
  * wrong device (e.g. the keyboard's own split half). */
 #define BT_APPEARANCE_HID_MOUSE 0x03C2
 
-static bool is_hid_mouse_ad(struct bt_data *data, void *user_data) {
+static bool __maybe_unused is_hid_mouse_ad(struct bt_data *data, void *user_data) {
     bool *match = user_data;
     if (data->type == BT_DATA_GAP_APPEARANCE && data->data_len >= 2) {
         uint16_t appearance = sys_get_le16(data->data);
@@ -542,6 +703,22 @@ static bool is_hid_mouse_ad(struct bt_data *data, void *user_data) {
     }
     return true;
 }
+
+#if DT_INST_NODE_HAS_PROP(0, pair_name_prefix)
+#define PAIR_NAME_PREFIX DT_INST_PROP(0, pair_name_prefix)
+BUILD_ASSERT(sizeof(PAIR_NAME_PREFIX) > 1, "pair-name-prefix must not be empty");
+
+/* Local name (complete or shortened) starts with pair-name-prefix. */
+static bool is_name_prefix_ad(struct bt_data *data, void *user_data) {
+    bool *match = user_data;
+    if ((data->type == BT_DATA_NAME_COMPLETE || data->type == BT_DATA_NAME_SHORTENED) &&
+        data->data_len >= sizeof(PAIR_NAME_PREFIX) - 1 &&
+        memcmp(data->data, PAIR_NAME_PREFIX, sizeof(PAIR_NAME_PREFIX) - 1) == 0) {
+        *match = true;
+    }
+    return true;
+}
+#endif
 
 static void connect_to(const bt_addr_le_t *addr) {
     connecting = true;
@@ -573,20 +750,27 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t adv_type,
      * don't know the mouse's address ahead of time. Directed adverts carry no
      * AD payload and can't be appearance-matched, so they're intentionally not
      * accepted here -- a device we've never bonded to has nothing to reconnect
-     * to us for anyway. */
+     * to us for anyway. With pair-name-prefix, match the advertised name instead
+     * (appearance ignored); the name may be in the scan response (active scan). */
+    bool match = false;
+#if DT_INST_NODE_HAS_PROP(0, pair_name_prefix)
+    if (adv_type != BT_GAP_ADV_TYPE_ADV_IND && adv_type != BT_GAP_ADV_TYPE_SCAN_RSP) {
+        return;
+    }
+    bt_data_parse(ad, is_name_prefix_ad, &match);
+#else
     if (adv_type != BT_GAP_ADV_TYPE_ADV_IND) {
         return;
     }
-
-    bool match = false;
     bt_data_parse(ad, is_hid_mouse_ad, &match);
+#endif
     if (!match) {
         return;
     }
 
     char s[BT_ADDR_LE_STR_LEN];
     bt_addr_le_to_str(addr, s, sizeof(s));
-    LOG_INF("found HID mouse %s (rssi %d), connecting", s, rssi);
+    LOG_INF("found HID device %s (rssi %d), connecting", s, rssi);
     pairing_attempt = true; /* scanning only ever runs during fresh pairing */
     connect_to(addr);
 }
@@ -698,6 +882,10 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason) {
 
     LOG_INF("mouse disconnected (reason 0x%02x)", reason);
     release_all_buttons();
+#if IS_ENABLED(CONFIG_ZMK_BLE_MOUSE_HOST_FORWARD_KEYS)
+    /* Events must not be raised from this (BT) context; the workqueue does it. */
+    k_work_submit(&release_keys_work);
+#endif
 
     bt_conn_unref(mouse_conn);
     mouse_conn = NULL;

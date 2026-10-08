@@ -167,12 +167,52 @@ On a non-split board, `CONFIG_BT_MAX_CONN=2` (mouse + host) is enough.
 > The mouse must be bonded **only to the keyboard**, not simultaneously to a
 > computer, or the computer may grab it first.
 
+## ZMK devices (Efogtech Endgame)
+
+> This fork of [tadakado/zmk-ble-mouse-host](https://github.com/tadakado/zmk-ble-mouse-host)
+> adds support for ZMK-based pointing devices, tested target: an Efogtech Endgame
+> trackball on a dongle.
+
+A ZMK device is not a plain mouse: it advertises the *Keyboard* appearance
+(`0x03C1`) and sends keyboard, consumer and mouse reports, because its buttons and
+wheels can be bound to keys or media keys. Two additions cover that:
+
+- **`pair-name-prefix`** (devicetree string on the `zmk,ble-mouse-host` node).
+  Fresh pairing then matches the advertised local name (complete or shortened, in
+  the advertisement or its scan response) instead of the Mouse appearance. Pick a
+  prefix that does not also match the dongle's own name or the split halves:
+
+  ```dts
+  mouse_host: mouse_host {
+      compatible = "zmk,ble-mouse-host";
+      pair-name-prefix = "Endgame";
+  };
+  ```
+
+- **Keyboard and consumer reports** (`CONFIG_ZMK_BLE_MOUSE_HOST_FORWARD_KEYS`, on
+  by default). The report map is parsed for a keyboard report (modifiers plus a
+  6KRO key array or an NKRO bitmap) and a consumer report (array of 8- or 16-bit
+  usages). Each input report characteristic is routed by its Report ID (Report
+  Reference descriptor) and every press and release is raised as a
+  `zmk_keycode_state_changed` event (keyboard page `0x07`, modifiers as
+  `0xE0`-`0xE7`, consumer page `0x0C`) from the system workqueue. They take the
+  keyboard's normal HID path, so they combine with its own keys and modifiers.
+  Anything still held is released on disconnect or unpair. Mouse handling is
+  unchanged.
+
+The central must be able to carry what the device sends: with the default basic
+consumer usages (`CONFIG_ZMK_HID_CONSUMER_REPORT_USAGES_BASIC`), 16-bit consumer
+usages above `0xFF` are rejected by ZMK, so select `..._USAGES_FULL` on the central
+if the device uses them. Consumer reports that are bitmaps rather than usage arrays
+are not decoded.
+
 ## Kconfig options
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `CONFIG_ZMK_BLE_MOUSE_HOST` | `y` (when the DT node exists) | Enable the module. |
 | `CONFIG_ZMK_BLE_MOUSE_HOST_MAX_REPORTS` | `6` | Max notifying HID input-report characteristics tracked on the mouse. |
+| `CONFIG_ZMK_BLE_MOUSE_HOST_FORWARD_KEYS` | `y` | Also decode the device's keyboard and consumer reports and raise them as ZMK key events (see "ZMK devices"). |
 | `CONFIG_ZMK_BLE_MOUSE_HOST_LOG_REPORTS` | `n` | Verbose: log every decoded pointer report + a raw hexdump as the mouse moves. Noisy; for reverse-engineering a new mouse only. |
 | `CONFIG_ZMK_BLE_MOUSE_HOST_FORGET_ON_BOOT` | `n` | One-shot helper: clear all BLE **host** profiles on boot (keeps the mouse bond) so a computer can re-pair without a `&bt BT_CLR` key. Leave off for normal use. |
 
@@ -201,8 +241,9 @@ On a non-split board, `CONFIG_BT_MAX_CONN=2` (mouse + host) is enough.
 - **One mouse at a time.** Only a single external mouse is tracked.
 - **Buttons.** Up to 5 buttons are forwarded (left / right / middle / back /
   forward), matching ZMK's mouse HID.
-- **Discovery on fresh pairing needs a GAP *Mouse* appearance** (`0x03C2`).
-  A mouse that doesn't advertise its appearance won't be found by `&mouse_pair`.
+- **Discovery on fresh pairing needs a GAP *Mouse* appearance** (`0x03C2`),
+  unless `pair-name-prefix` is set (then the advertised name is matched instead).
+  A device that does neither won't be found by `&mouse_pair`.
   (Reconnecting to an already-bonded mouse doesn't rely on this.)
 - **No reconnect back-off.** While the mouse is off/absent, the central keeps
   initiating to reconnect (there's no low-duty fallback). Harmless on a
@@ -214,8 +255,9 @@ On a non-split board, `CONFIG_BT_MAX_CONN=2` (mouse + host) is enough.
 
 ## Tests
 
-The HID report-descriptor parser is hardware-independent and has host-side unit
-tests:
+The HID report-descriptor parser and the keyboard/consumer diff logic are
+hardware-independent and have host-side unit tests (including ZMK's own report
+descriptors):
 
 ```sh
 make -C test        # builds & runs the tests with your host cc

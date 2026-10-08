@@ -34,6 +34,17 @@ config ZMK_BLE_MOUSE_HOST_MAX_REPORTS
       Upper bound on the number of notifying HID Input Report characteristics
       tracked on the connected mouse (report protocol). Boot protocol uses one.
 
+config ZMK_BLE_MOUSE_HOST_FORWARD_KEYS
+    bool "Forward the device's keyboard and consumer reports as ZMK key events"
+    default y
+    help
+      For a ZMK-style device (e.g. a trackball whose buttons or wheels are bound
+      to keys or media keys), also decode its HID keyboard and consumer input
+      reports and raise a zmk_keycode_state_changed event for every press and
+      release. They go through this keyboard's normal HID path, so modifiers
+      combine with its own keys. Everything still held is released when the
+      device disconnects. Has no effect on a plain mouse.
+
 config ZMK_BLE_MOUSE_HOST_FORGET_ON_BOOT
     bool "Clear all BLE host profiles on boot (one-shot host re-pair helper)"
     default n

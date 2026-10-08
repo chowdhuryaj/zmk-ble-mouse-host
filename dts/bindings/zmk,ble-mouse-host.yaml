@@ -10,6 +10,15 @@ description: |
 compatible: "zmk,ble-mouse-host"
 
 properties:
+  pair-name-prefix:
+    type: string
+    description: |
+      Fresh pairing (mouse_pair) connects to the first device whose advertised
+      local name (complete or shortened, in the advertisement or its scan
+      response) starts with this string, whatever its GAP appearance. Needed for
+      ZMK devices, which advertise the Keyboard appearance (0x03C1). Pick a
+      prefix that does not match this keyboard's own name or its split halves.
+      If unset, pairing matches the HID Mouse appearance (0x03C2) instead.
   wheel-invert-usb:
     type: boolean
     description: |
