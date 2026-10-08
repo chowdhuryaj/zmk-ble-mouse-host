@@ -34,6 +34,14 @@ config ZMK_BLE_MOUSE_HOST_MAX_REPORTS
       Upper bound on the number of notifying HID Input Report characteristics
       tracked on the connected mouse (report protocol). Boot protocol uses one.
 
+config ZMK_BLE_MOUSE_HOST_RECONNECT_DELAY_MS
+    int "Delay before retrying a failed mouse connect or busy scan (ms)"
+    default 3000
+    help
+      After a failed or timed-out connection attempt, or when the scanner or
+      initiator is busy (e.g. ZMK's split central is using it), wait this long
+      before retrying, so the split central gets its turn.
+
 config ZMK_BLE_MOUSE_HOST_FORWARD_KEYS
     bool "Forward the device's keyboard and consumer reports as ZMK key events"
     default y

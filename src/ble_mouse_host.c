@@ -112,7 +112,25 @@ static void mh_retry_work_cb(struct k_work *work) {
     ARG_UNUSED(work);
     mh_begin();
 }
-static K_WORK_DEFINE(mh_retry_work, mh_retry_work_cb);
+static K_WORK_DELAYABLE_DEFINE(mh_retry_work, mh_retry_work_cb);
+
+/* Delay before retrying after a failed/timed-out create or -EALREADY. This device
+ * is also ZMK's split central, which shares Zephyr's single connection initiator
+ * and scanner with us; an immediate retry would starve it of initiator windows. */
+#define MH_RETRY_DELAY K_MSEC(CONFIG_ZMK_BLE_MOUSE_HOST_RECONNECT_DELAY_MS)
+
+/* True only while the scan running is ours (bt_le_scan_start returned 0). A scan
+ * started by ZMK's split central must never be stopped by us: ZMK's is_scanning
+ * would stay true and it would never rescan for a dropped half. */
+static bool scan_owned;
+
+static void stop_own_scan(void) {
+    if (scan_owned) {
+        bt_le_scan_stop();
+        scan_owned = false;
+    }
+    mode = MH_IDLE;
+}
 
 /* ---- settings (persist the bonded mouse address) ----------------------- */
 
@@ -722,13 +740,14 @@ static bool is_name_prefix_ad(struct bt_data *data, void *user_data) {
 
 static void connect_to(const bt_addr_le_t *addr) {
     connecting = true;
-    bt_le_scan_stop();
+    stop_own_scan();
 
     int err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN, MH_CONN_PARAM, &mouse_conn);
     if (err) {
         LOG_ERR("create connection failed (err %d)", err);
         connecting = false;
-        k_work_submit(&mh_retry_work);
+        /* -EALREADY: ZMK's split central is initiating. Back off so it can finish. */
+        k_work_reschedule(&mh_retry_work, MH_RETRY_DELAY);
     }
 }
 
@@ -780,8 +799,17 @@ static K_WORK_DELAYABLE_DEFINE(scan_retry, scan_retry_fn);
 
 static void start_scan(void) {
     mode = MH_SCAN;
+    if (scan_owned) {
+        return; /* our scan is already running (e.g. a stale retry fired) */
+    }
     int err = bt_le_scan_start(BT_LE_SCAN_ACTIVE, scan_cb);
-    if (err && err != -EALREADY) {
+    if (err == -EALREADY) {
+        /* Someone else (ZMK's split central) owns the scanner. Don't claim it, or
+         * stop it later; wait and retry so pairing works once their scan ends. */
+        LOG_WRN("scan busy (another scan is running); retrying in %d ms",
+                CONFIG_ZMK_BLE_MOUSE_HOST_RECONNECT_DELAY_MS);
+        k_work_reschedule(&scan_retry, MH_RETRY_DELAY);
+    } else if (err) {
         /* A pairing scan can be requested while the BT stack is still busy
          * (e.g. -EBUSY), so a start can transiently fail. Retry shortly rather
          * than going silent until some other event (disconnect, another
@@ -789,6 +817,7 @@ static void start_scan(void) {
         LOG_ERR("scan start failed (err %d); retrying shortly", err);
         k_work_reschedule(&scan_retry, K_MSEC(200));
     } else {
+        scan_owned = true;
         LOG_INF("scanning for a HID mouse to pair");
     }
 }
@@ -860,7 +889,7 @@ static void on_connected(struct bt_conn *conn, uint8_t err) {
         LOG_ERR("mouse connection failed (err 0x%02x)", err);
         bt_conn_unref(mouse_conn);
         mouse_conn = NULL;
-        k_work_submit(&mh_retry_work);
+        k_work_reschedule(&mh_retry_work, MH_RETRY_DELAY);
         return;
     }
 
@@ -896,7 +925,7 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason) {
         sub[i].value_handle = 0;
     }
 
-    k_work_submit(&mh_retry_work);
+    k_work_reschedule(&mh_retry_work, K_NO_WAIT);
 }
 
 static void clear_bond(void) {
@@ -920,8 +949,7 @@ void zmk_ble_mouse_host_pair(void) {
          * fresh scan. */
         bt_conn_disconnect(mouse_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
     } else {
-        bt_le_scan_stop(); /* in case a stale scan for the old bond is running */
-        mode = MH_IDLE;
+        stop_own_scan(); /* in case a stale scan of ours for the old bond is running */
         mh_begin();
     }
 }
@@ -934,8 +962,7 @@ void zmk_ble_mouse_host_unpair(void) {
     if (mouse_conn) {
         bt_conn_disconnect(mouse_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
     } else {
-        bt_le_scan_stop();
-        mode = MH_IDLE;
+        stop_own_scan();
     }
 }
 
@@ -945,8 +972,7 @@ void zmk_ble_mouse_host_unpair(void) {
 void zmk_ble_mouse_host_pause(void) {
     mh_paused = true;
     if (mode == MH_SCAN) {
-        bt_le_scan_stop();
-        mode = MH_IDLE;
+        stop_own_scan();
     }
     if (mouse_conn) {
         /* Disconnects a live link, or cancels an in-flight reconnect-initiate
