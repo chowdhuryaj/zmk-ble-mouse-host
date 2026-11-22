@@ -51,6 +51,19 @@ config ZMK_BLE_MOUSE_HOST_LIST_SCAN_S
       cannot scan for a dropped half and the bonded mouse is not reconnected.
       Keep it short.
 
+config ZMK_BLE_MOUSE_HOST_PAIR_TIMEOUT_S
+    int "First-match pairing (&mouse_pair) gives up after, seconds"
+    default 60
+    range 10 600
+
+config ZMK_BLE_MOUSE_HOST_PAIR_MIN_RSSI
+    int "First-match pairing only takes a mouse at least this strong, dBm"
+    default -50
+    range -127 0
+    help
+      About arm's length. Keeps &mouse_pair from bonding a colleague's mouse
+      across the room (Just Works pairing accepts any).
+
 config ZMK_BLE_MOUSE_HOST_LIST_SIZE
     int "Devices remembered by the list scan"
     default 8

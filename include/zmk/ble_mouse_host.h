@@ -60,6 +60,8 @@ struct zmk_ble_mouse_host_status {
     enum zmk_ble_mouse_host_state state;
     bool bonded;
     bool listing;      /* a zmk_ble_mouse_host_scan_start() list scan is running */
+    bool scan_waiting; /* listing, but the scanner is busy (ZMK's split central is
+                        * scanning for a disconnected half); retried every few s */
     bt_addr_le_t addr; /* bonded mouse, else the pairing target; zero if none */
     char name[ZMK_BLE_MOUSE_HOST_NAME_MAX + 1]; /* from its advertising; "" if unknown */
     uint8_t battery;   /* BAS level 0-100, 0xFF = unknown / no BAS */
@@ -87,10 +89,18 @@ int zmk_ble_mouse_host_scan_count(void);
 /* 0, or -ENOENT past the end. */
 int zmk_ble_mouse_host_scan_get(int idx, struct zmk_ble_mouse_host_scan_result *out);
 
+/* &mouse_pair: first device with the Mouse appearance at RSSI >=
+ * CONFIG_ZMK_BLE_MOUSE_HOST_PAIR_MIN_RSSI, for up to
+ * CONFIG_ZMK_BLE_MOUSE_HOST_PAIR_TIMEOUT_S; the bonded mouse is kept aside
+ * and comes back on timeout or failure (see pair_addr). A list scan start
+ * cancels it. */
+
 /* Pair the device at addr (it must be in pairing mode), replacing the bonded
  * mouse. The old bond is kept until the new one forms: while trying,
- * status.bonded is false and status.addr is the target; on success the old
- * mouse is unpaired; after 5 failed tries (or a refusal) the old bond comes
+ * status.bonded is false and status.addr is the target; once the new one is
+ * connected and subscribed the old mouse is unpaired (a device that bonds but
+ * has no HID service counts as a failure); re-pairing the bonded address
+ * itself starts fresh, with no fallback; after 5 failed tries (or a refusal) the old bond comes
  * back (bonded true again), or the state goes IDLE if there was none. */
 void zmk_ble_mouse_host_pair_addr(const bt_addr_le_t *addr);
 
