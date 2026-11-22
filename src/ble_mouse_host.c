@@ -119,6 +119,14 @@ static bt_addr_le_t target_addr;
 static bool have_target;
 static uint8_t target_tries;
 
+/* The bond held before a pair-by-address attempt. Its keys and saved
+ * settings stay until the new mouse bonds (then it is unpaired), so a
+ * failed attempt, or a reboot mid-attempt, falls back to it. */
+static bt_addr_le_t prev_addr;
+static char prev_name[ZMK_BLE_MOUSE_HOST_NAME_MAX + 1];
+static bool have_prev;
+static void target_failed(void);
+
 /* Set by zmk_ble_mouse_host_unpair() to stop reconnect/scan attempts until
  * zmk_ble_mouse_host_pair() is called. */
 static bool mh_paused;
@@ -242,7 +250,10 @@ static void emit_motion(int dx, int dy, int wheel, int pan, uint8_t buttons) {
      * them first puts the sync on a forwarded event whenever there is one. */
     for (int b = 7; b >= 0; b--) {
         if (changed & BIT(b)) {
-            input_report_key(mh_dev, INPUT_BTN_0 + b, (buttons >> b) & 1, SYNC, K_NO_WAIT);
+            /* Short wait, not K_NO_WAIT: a button event dropped on a full
+             * input queue would leave its key position held (stuck layer or
+             * key). Runs on the system workqueue; motion still never waits. */
+            input_report_key(mh_dev, INPUT_BTN_0 + b, (buttons >> b) & 1, SYNC, K_MSEC(10));
         }
     }
     if (dx) {
@@ -435,6 +446,16 @@ static void rep_work_cb(struct k_work *work) {
 }
 K_WORK_DEFINE(rep_work, rep_work_cb);
 
+/* Disconnect: release held buttons on the same workqueue as rep_work, after
+ * dropping reports still queued, so prev_buttons has one owner and a queued
+ * press can't re-press a button after its release. */
+static void release_work_cb(struct k_work *work) {
+    ARG_UNUSED(work);
+    k_msgq_purge(&rep_q);
+    release_all_buttons();
+}
+static K_WORK_DEFINE(release_work, release_work_cb);
+
 /* ---- GATT notify ------------------------------------------------------- */
 
 /* Which decoder a notification on this handle goes to. Keyboard / consumer reports
@@ -559,7 +580,13 @@ static K_WORK_DELAYABLE_DEFINE(battery_work, battery_work_cb);
 
 static void battery_work_cb(struct k_work *work) {
     ARG_UNUSED(work);
-    if (!mouse_conn || connecting || n_subs == 0) {
+    /* mouse_conn belongs to the BT thread (on_disconnected unrefs it), so
+     * take our own reference by address instead of reading it here. */
+    if (!have_bond) {
+        return;
+    }
+    struct bt_conn *c = bt_conn_lookup_addr_le(BT_ID_DEFAULT, &mouse_addr);
+    if (!c) {
         return;
     }
     bas_read.func = bas_read_cb;
@@ -567,7 +594,8 @@ static void battery_work_cb(struct k_work *work) {
     bas_read.by_uuid.start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
     bas_read.by_uuid.end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
     bas_read.by_uuid.uuid = BT_UUID_BAS_BATTERY_LEVEL;
-    bt_gatt_read(mouse_conn, &bas_read);
+    bt_gatt_read(c, &bas_read); /* fails harmlessly if the link just dropped */
+    bt_conn_unref(c);
     k_work_reschedule(&battery_work, MH_BATTERY_PERIOD);
 }
 
@@ -715,7 +743,11 @@ static uint8_t disc_service_cb(struct bt_conn *conn, const struct bt_gatt_attr *
              * mh_begin() then idles until the user triggers pairing again
              * (clear_bond() also drops a pair-by-address target). */
             LOG_WRN("pairing target has no HID service; not a mouse -- dropping it");
-            clear_bond();
+            if (have_target) {
+                target_failed();
+            } else {
+                clear_bond();
+            }
             bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
         } else {
             /* A real bonded mouse always has the service, so this is unexpected.
@@ -975,9 +1007,7 @@ static void mh_begin(void) {
          * directly. A few tries (it may have left pairing mode), then give up. */
         if (target_tries++ >= MH_TARGET_TRIES) {
             LOG_WRN("PAIR: chosen mouse did not pair after %d tries; giving up", MH_TARGET_TRIES);
-            have_target = false;
-            mouse_name[0] = '\0';
-            mh_notify();
+            target_failed();
             return;
         }
         pairing_attempt = true;
@@ -1053,7 +1083,7 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason) {
     }
 
     LOG_INF("mouse disconnected (reason 0x%02x)", reason);
-    release_all_buttons();
+    k_work_submit(&release_work);
     k_work_cancel_delayable(&battery_work);
     battery = 0xFF;
 #if IS_ENABLED(CONFIG_ZMK_BLE_MOUSE_HOST_FORWARD_KEYS)
@@ -1080,6 +1110,10 @@ static void clear_bond(void) {
     if (have_bond) {
         bt_unpair(BT_ID_DEFAULT, &mouse_addr);
     }
+    if (have_prev) {
+        bt_unpair(BT_ID_DEFAULT, &prev_addr);
+        have_prev = false;
+    }
     settings_delete("mouse_host/addr");
     settings_delete("mouse_host/name");
     have_bond = false;
@@ -1087,6 +1121,29 @@ static void clear_bond(void) {
     memset(&mouse_addr, 0, sizeof(mouse_addr));
     mouse_name[0] = '\0';
     LOG_INF("cleared stored mouse bond");
+    mh_notify();
+}
+
+/* A pair-by-address attempt failed: drop whatever half-made bond it left and
+ * go back to the previous mouse, if there was one. */
+static void target_failed(void) {
+    if (!have_target) {
+        return;
+    }
+    have_target = false;
+    if (!have_prev || bt_addr_le_cmp(&prev_addr, &target_addr)) {
+        bt_unpair(BT_ID_DEFAULT, &target_addr);
+    }
+    if (have_prev) {
+        bt_addr_le_copy(&mouse_addr, &prev_addr);
+        memcpy(mouse_name, prev_name, sizeof(mouse_name));
+        have_bond = true;
+        have_prev = false;
+        LOG_INF("PAIR: back to the previous mouse");
+    } else {
+        mouse_name[0] = '\0';
+    }
+    k_work_reschedule(&mh_retry_work, MH_RETRY_DELAY);
     mh_notify();
 }
 
@@ -1258,22 +1315,28 @@ void zmk_ble_mouse_host_pair_addr(const bt_addr_le_t *addr) {
     bt_addr_le_t a;
     bt_addr_le_copy(&a, addr); /* addr may point into results[] */
 
+    /* First: ends a list scan (listing = false), or mh_begin() would wait
+     * on it forever when the link below drops. */
+    stop_own_scan();
+    k_work_cancel_delayable(&list_end);
     mh_paused = false;
     pairing_requested = false; /* not a first-match scan */
-    k_work_cancel_delayable(&list_end);
-    clear_bond();
+    if (have_bond) {
+        /* Keep the bond (keys + saved settings) until the new one forms. */
+        bt_addr_le_copy(&prev_addr, &mouse_addr);
+        memcpy(prev_name, mouse_name, sizeof(prev_name));
+        have_prev = true;
+        have_bond = false;
+    }
     bt_addr_le_copy(&target_addr, &a);
     have_target = true;
     target_tries = 0;
-    if (r) {
-        memcpy(mouse_name, r->name, sizeof(mouse_name));
-    }
+    memcpy(mouse_name, r ? r->name : "", r ? sizeof(mouse_name) : 1);
     if (mouse_conn) {
         /* on_disconnected() / on_connected(err) defer to mh_begin(), which
          * connects to the target. */
         bt_conn_disconnect(mouse_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
     } else {
-        stop_own_scan(); /* also ends a list scan */
         mh_begin();
     }
     mh_notify();
@@ -1293,7 +1356,10 @@ static void on_security_changed(struct bt_conn *conn, bt_security_t level,
          * security failure with an unrelated peer must NOT wipe the real
          * mouse's bond. */
         bool is_bonded_peer = have_bond && !bt_addr_le_cmp(bt_conn_get_dst(conn), &mouse_addr);
-        if (is_bonded_peer || !have_bond) {
+        if (have_target && pairing_attempt) {
+            LOG_WRN("chosen mouse refused pairing (err %d)", err);
+            target_failed();
+        } else if (is_bonded_peer || !have_bond) {
             LOG_WRN("mouse security failed (err %d); clearing stale bond to re-pair", err);
             clear_bond();
         } else {
@@ -1326,6 +1392,10 @@ static void on_pairing_complete(struct bt_conn *conn, bool bonded) {
     bt_addr_le_copy(&mouse_addr, bt_conn_get_dst(conn));
     have_bond = true;
     have_target = false;
+    if (have_prev && bt_addr_le_cmp(&prev_addr, &mouse_addr)) {
+        bt_unpair(BT_ID_DEFAULT, &prev_addr); /* the old mouse, now replaced */
+    }
+    have_prev = false;
     pairing_requested = false; /* pairing session complete; back to reconnect-only */
     int err = settings_save_one("mouse_host/addr", &mouse_addr, sizeof(mouse_addr));
     settings_save_one("mouse_host/name", mouse_name, strlen(mouse_name));

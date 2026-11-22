@@ -87,8 +87,11 @@ int zmk_ble_mouse_host_scan_count(void);
 /* 0, or -ENOENT past the end. */
 int zmk_ble_mouse_host_scan_get(int idx, struct zmk_ble_mouse_host_scan_result *out);
 
-/* Forget the bonded mouse and pair the device at addr (it must be in pairing
- * mode). Retries a few times, then gives up (state back to IDLE). */
+/* Pair the device at addr (it must be in pairing mode), replacing the bonded
+ * mouse. The old bond is kept until the new one forms: while trying,
+ * status.bonded is false and status.addr is the target; on success the old
+ * mouse is unpaired; after 5 failed tries (or a refusal) the old bond comes
+ * back (bonded true again), or the state goes IDLE if there was none. */
 void zmk_ble_mouse_host_pair_addr(const bt_addr_le_t *addr);
 
 /* Raised (from the system workqueue) whenever anything in the status may have
