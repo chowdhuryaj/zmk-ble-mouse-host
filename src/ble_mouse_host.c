@@ -1233,6 +1233,23 @@ void zmk_ble_mouse_host_pair(void) {
 }
 
 void zmk_ble_mouse_host_unpair(void) {
+    if (pairing_requested || have_target) {
+        /* During a pairing attempt, unpair means cancel: same as the
+         * timeout, the mouse set aside comes back (the app's "Cancel
+         * pairing"). */
+        LOG_INF("PAIR: unpair during pairing -- cancelling the attempt");
+        bt_addr_le_t peer;
+        bool target = have_target;
+        bt_addr_le_copy(&peer, &target_addr);
+        if (mouse_conn) {
+            bt_conn_disconnect(mouse_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+        }
+        if (!listing) {
+            stop_own_scan();
+        }
+        attempt_failed(target ? &peer : NULL);
+        return;
+    }
     LOG_INF("PAIR: unpair trigger -- forgetting the bonded mouse and pausing");
     mh_paused = true;
     pairing_requested = false;

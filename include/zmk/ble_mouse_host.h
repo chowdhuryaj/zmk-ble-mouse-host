@@ -11,7 +11,8 @@ void zmk_ble_mouse_host_pair(void);
 
 /* Forget the bonded mouse (if any), disconnect it (if connected), and stop
  * trying to reconnect until zmk_ble_mouse_host_pair() is called again.
- * Intended for a keymap trigger. */
+ * During a pairing attempt (first match or pair_addr) it only cancels the
+ * attempt and the mouse set aside comes back. Intended for a keymap trigger. */
 void zmk_ble_mouse_host_unpair(void);
 
 /* Log the mouse bond address, connection state, and (if known) the parsed HID
