@@ -42,6 +42,20 @@ config ZMK_BLE_MOUSE_HOST_RECONNECT_DELAY_MS
       initiator is busy (e.g. ZMK's split central is using it), wait this long
       before retrying, so the split central gets its turn.
 
+config ZMK_BLE_MOUSE_HOST_LIST_SCAN_S
+    int "List scan length (zmk_ble_mouse_host_scan_start), seconds"
+    default 15
+    range 3 120
+    help
+      The list scan holds the scanner, so while it runs ZMK's split central
+      cannot scan for a dropped half and the bonded mouse is not reconnected.
+      Keep it short.
+
+config ZMK_BLE_MOUSE_HOST_LIST_SIZE
+    int "Devices remembered by the list scan"
+    default 8
+    range 1 32
+
 config ZMK_BLE_MOUSE_HOST_FORWARD_KEYS
     bool "Forward the device's keyboard and consumer reports as ZMK key events"
     default y

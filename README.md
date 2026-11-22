@@ -206,12 +206,34 @@ usages above `0xFF` are rejected by ZMK, so select `..._USAGES_FULL` on the cent
 if the device uses them. Consumer reports that are bitmaps rather than usage arrays
 are not decoded.
 
+## Choosing a mouse from a list (configurator API)
+
+> AJ fork. `include/zmk/ble_mouse_host.h` has the C API; Totem-ZMK's Flask
+> channel (`docs/mouse-host.md` there) drives it from an app.
+
+- `zmk_ble_mouse_host_scan_start()` runs an active scan for
+  `CONFIG_ZMK_BLE_MOUSE_HOST_LIST_SCAN_S` seconds and lists every device whose
+  advertising carries the Mouse appearance or the HID service UUID, with name,
+  address, appearance and RSSI. It never connects. A connected mouse stays
+  connected; a pending reconnect to the bonded mouse waits for the scan to end.
+- `zmk_ble_mouse_host_pair_addr(addr)` forgets the bonded mouse and connects to
+  that address directly (5 tries), then bonds as `&mouse_pair` does.
+- `zmk_ble_mouse_host_get_status()`: idle / scanning / connecting / connected,
+  bonded flag, address, name (saved with the bond), battery % (BAS, re-read
+  every 5 minutes; 0xFF without BAS) and the report map's button count.
+- `zmk_ble_mouse_host_state_changed` (ZMK event, raised from the system
+  workqueue) fires whenever any of that may have changed.
+
+`&mouse_pair` (first match) is unchanged.
+
 ## Kconfig options
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `CONFIG_ZMK_BLE_MOUSE_HOST` | `y` (when the DT node exists) | Enable the module. |
 | `CONFIG_ZMK_BLE_MOUSE_HOST_MAX_REPORTS` | `6` | Max notifying HID input-report characteristics tracked on the mouse. |
+| `CONFIG_ZMK_BLE_MOUSE_HOST_LIST_SCAN_S` | `15` | List scan length, seconds. The split central cannot scan meanwhile. |
+| `CONFIG_ZMK_BLE_MOUSE_HOST_LIST_SIZE` | `8` | Devices the list scan remembers (first come, first kept). |
 | `CONFIG_ZMK_BLE_MOUSE_HOST_FORWARD_KEYS` | `y` | Also decode the device's keyboard and consumer reports and raise them as ZMK key events (see "ZMK devices"). |
 | `CONFIG_ZMK_BLE_MOUSE_HOST_LOG_REPORTS` | `n` | Verbose: log every decoded pointer report + a raw hexdump as the mouse moves. Noisy; for reverse-engineering a new mouse only. |
 | `CONFIG_ZMK_BLE_MOUSE_HOST_FORGET_ON_BOOT` | `n` | One-shot helper: clear all BLE **host** profiles on boot (keeps the mouse bond) so a computer can re-pair without a `&bt BT_CLR` key. Leave off for normal use. |
@@ -258,7 +280,7 @@ are not decoded.
 
 ## Tests
 
-The HID report-descriptor parser and the keyboard/consumer diff logic are
+The HID report-descriptor parser, the advertising-data parser and the keyboard/consumer diff logic are
 hardware-independent and have host-side unit tests (including ZMK's own report
 descriptors):
 

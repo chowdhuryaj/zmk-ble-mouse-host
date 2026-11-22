@@ -22,6 +22,11 @@
  * With CONFIG_ZMK_BLE_MOUSE_HOST_FORWARD_KEYS the device's keyboard and consumer
  * input reports are also decoded and raised as zmk_keycode_state_changed events
  * (from the system workqueue), so a ZMK trackball keeps its key/media bindings.
+ *
+ * AJ fork additions: a list scan that only collects nearby HID devices (never
+ * connects) and pairing to one chosen address, for a configurator; plus a
+ * status snapshot (state, name, battery, button count) and a state-changed
+ * event, for a status widget. See include/zmk/ble_mouse_host.h.
  */
 
 #define DT_DRV_COMPAT zmk_ble_mouse_host
@@ -48,6 +53,8 @@
 #endif
 
 LOG_MODULE_REGISTER(ble_mouse_host, CONFIG_ZMK_BLE_MOUSE_HOST_LOG_LEVEL);
+
+ZMK_EVENT_IMPL(zmk_ble_mouse_host_state_changed);
 
 #if DT_HAS_COMPAT_STATUS_OKAY(DT_DRV_COMPAT)
 
@@ -100,9 +107,50 @@ static struct bt_gatt_read_params map_read;
 
 static uint8_t prev_buttons;
 
+/* Name of the bonded mouse (or pairing target), taken from its advertising at
+ * pairing time and saved with the bond, so the status has it after a reboot. */
+static char mouse_name[ZMK_BLE_MOUSE_HOST_NAME_MAX + 1];
+static uint8_t battery = 0xFF; /* BAS level of the connected mouse, 0xFF unknown */
+
+/* zmk_ble_mouse_host_pair_addr() target: connected to directly (no scan, the
+ * address is known), MH_TARGET_TRIES times, then given up. */
+#define MH_TARGET_TRIES 5
+static bt_addr_le_t target_addr;
+static bool have_target;
+static uint8_t target_tries;
+
+/* Set by zmk_ble_mouse_host_unpair() to stop reconnect/scan attempts until
+ * zmk_ble_mouse_host_pair() is called. */
+static bool mh_paused;
+
+/* Set by the mouse_pair trigger, cleared when that pairing session ends. Gates
+ * scanning for a NEW mouse: there is deliberately no automatic scan -- while
+ * unbonded, mh_begin() idles until mouse_pair is pressed, so a boot-time scan
+ * can't interfere with the split's own peripheral pairing. Reconnecting to an
+ * already-bonded mouse is automatic (have_bond branch) and unaffected. */
+static bool pairing_requested;
+
+/* List scan (zmk_ble_mouse_host_scan_start): collects, never connects. */
+static bool listing;
+static struct zmk_ble_mouse_host_scan_result results[CONFIG_ZMK_BLE_MOUSE_HOST_LIST_SIZE];
+static int n_results;
+
 static void mh_begin(void);
 static void start_discovery(struct bt_conn *conn);
 static void clear_bond(void);
+
+/* Status changed: raise the event from the system workqueue, never from a BT
+ * callback (listeners may touch the display or the keymap). */
+static void notify_work_cb(struct k_work *work) {
+    ARG_UNUSED(work);
+    struct zmk_ble_mouse_host_status st;
+    zmk_ble_mouse_host_get_status(&st);
+    raise_zmk_ble_mouse_host_state_changed(
+        (struct zmk_ble_mouse_host_state_changed){.state = st.state});
+}
+static K_WORK_DEFINE(notify_work, notify_work_cb);
+
+static void mh_notify(void) { k_work_submit(&notify_work); }
 
 /* Never call bt_conn_le_create() (which mh_begin() may do) from within a BT
  * connection callback -- doing so re-entrantly deadlocks the device. Callbacks
@@ -130,6 +178,8 @@ static void stop_own_scan(void) {
         scan_owned = false;
     }
     mode = MH_IDLE;
+    listing = false; /* the list scan rides the same scan */
+    mh_notify();
 }
 
 /* ---- settings (persist the bonded mouse address) ----------------------- */
@@ -140,6 +190,11 @@ static int mh_settings_set(const char *name, size_t len, settings_read_cb read_c
         if (rc == sizeof(mouse_addr)) {
             have_bond = true;
         }
+        return 0;
+    }
+    if (settings_name_steq(name, "name", NULL)) {
+        ssize_t rc = read_cb(cb_arg, mouse_name, sizeof(mouse_name) - 1);
+        mouse_name[rc > 0 ? rc : 0] = '\0';
         return 0;
     }
     return -ENOENT;
@@ -477,6 +532,40 @@ static uint8_t read_map_cb(struct bt_conn *conn, uint8_t err,
     return BT_GATT_ITER_STOP;
 }
 
+/* Battery level (BAS 0x2A19), read by UUID over the whole handle range, so no
+ * service discovery is needed; a mouse without BAS just answers "not found".
+ * Re-read every few minutes instead of subscribing: notify support is
+ * optional in BAS, and a CCC auto-discovery past a non-notifying
+ * characteristic could pick up the next characteristic's CCC. */
+#define MH_BATTERY_PERIOD K_MINUTES(5)
+static struct bt_gatt_read_params bas_read;
+
+static uint8_t bas_read_cb(struct bt_conn *conn, uint8_t err, struct bt_gatt_read_params *params,
+                           const void *data, uint16_t length) {
+    if (!err && data && length >= 1) {
+        battery = MIN(((const uint8_t *)data)[0], 100);
+        mh_notify();
+    }
+    return BT_GATT_ITER_STOP;
+}
+
+static void battery_work_cb(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(battery_work, battery_work_cb);
+
+static void battery_work_cb(struct k_work *work) {
+    ARG_UNUSED(work);
+    if (!mouse_conn || connecting || n_subs == 0) {
+        return;
+    }
+    bas_read.func = bas_read_cb;
+    bas_read.handle_count = 0; /* read by UUID */
+    bas_read.by_uuid.start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
+    bas_read.by_uuid.end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
+    bas_read.by_uuid.uuid = BT_UUID_BAS_BATTERY_LEVEL;
+    bt_gatt_read(mouse_conn, &bas_read);
+    k_work_reschedule(&battery_work, MH_BATTERY_PERIOD);
+}
+
 static void do_subscribe(struct bt_conn *conn, uint16_t value_handle, int idx) {
     sub[idx].notify = notify_cb;
     sub[idx].value = BT_GATT_CCC_NOTIFY;
@@ -510,6 +599,10 @@ static void do_subscribes(struct bt_conn *conn) {
 
     LOG_INF("mouse ready: %d subscription(s) (%d report char(s) + %s boot)", n_subs, n_reports,
             boot_mouse_handle ? "1" : "0");
+    /* After the subscribe writes have had time to land (a read issued while
+     * they are in flight can fail, see subscribe_phase()). */
+    k_work_reschedule(&battery_work, K_SECONDS(2));
+    mh_notify();
 }
 
 #if IS_ENABLED(CONFIG_ZMK_BLE_MOUSE_HOST_FORWARD_KEYS)
@@ -614,7 +707,8 @@ static uint8_t disc_service_cb(struct bt_conn *conn, const struct bt_gatt_attr *
             /* We connected to a scan match that has no HID service -- a device
              * that advertised the mouse appearance but isn't one. Undo the bond
              * just formed with it and disconnect, so we never reconnect to it;
-             * mh_begin() then idles until the user triggers pairing again. */
+             * mh_begin() then idles until the user triggers pairing again
+             * (clear_bond() also drops a pair-by-address target). */
             LOG_WRN("pairing target has no HID service; not a mouse -- dropping it");
             clear_bond();
             bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
@@ -709,37 +803,16 @@ static void start_discovery(struct bt_conn *conn) {
 
 /* ---- scanning / connecting --------------------------------------------- */
 
-/* Match the Mouse appearance (0x03C2) specifically -- NOT the whole 0x03C0-
- * 0x03CF HID range and NOT the HID service UUID (0x1812), both of which ZMK's
- * own keyboard advertising also carries, so a broader match connects to the
- * wrong device (e.g. the keyboard's own split half). */
-#define BT_APPEARANCE_HID_MOUSE 0x03C2
-
-static bool __maybe_unused is_hid_mouse_ad(struct bt_data *data, void *user_data) {
-    bool *match = user_data;
-    if (data->type == BT_DATA_GAP_APPEARANCE && data->data_len >= 2) {
-        uint16_t appearance = sys_get_le16(data->data);
-        if (appearance == BT_APPEARANCE_HID_MOUSE) {
-            *match = true;
-        }
-    }
-    return true;
-}
+/* First-match pairing (&mouse_pair) matches the Mouse appearance (0x03C2)
+ * specifically -- NOT the whole 0x03C0-0x03CF HID range and NOT the HID
+ * service UUID (0x1812), both of which ZMK's own keyboard advertising also
+ * carries, so a broader match connects to the wrong device (e.g. the
+ * keyboard's own split half). The list scan is broader (ad_is_hid()): a person
+ * picks from it, so a keyboard in the list costs nothing. */
 
 #if DT_INST_NODE_HAS_PROP(0, pair_name_prefix)
 #define PAIR_NAME_PREFIX DT_INST_PROP(0, pair_name_prefix)
 BUILD_ASSERT(sizeof(PAIR_NAME_PREFIX) > 1, "pair-name-prefix must not be empty");
-
-/* Local name (complete or shortened) starts with pair-name-prefix. */
-static bool is_name_prefix_ad(struct bt_data *data, void *user_data) {
-    bool *match = user_data;
-    if ((data->type == BT_DATA_NAME_COMPLETE || data->type == BT_DATA_NAME_SHORTENED) &&
-        data->data_len >= sizeof(PAIR_NAME_PREFIX) - 1 &&
-        memcmp(data->data, PAIR_NAME_PREFIX, sizeof(PAIR_NAME_PREFIX) - 1) == 0) {
-        *match = true;
-    }
-    return true;
-}
 #endif
 
 static void connect_to(const bt_addr_le_t *addr) {
@@ -753,39 +826,72 @@ static void connect_to(const bt_addr_le_t *addr) {
         /* -EALREADY: ZMK's split central is initiating. Back off so it can finish. */
         k_work_reschedule(&mh_retry_work, MH_RETRY_DELAY);
     }
+    mh_notify();
+}
+
+static struct zmk_ble_mouse_host_scan_result *find_result(const bt_addr_le_t *addr) {
+    for (int i = 0; i < n_results; i++) {
+        if (!bt_addr_le_cmp(&results[i].addr, addr)) {
+            return &results[i];
+        }
+    }
+    return NULL;
+}
+
+/* List scan: remember every HID advertiser once (refreshing RSSI). The name
+ * often only comes in the scan response (active scan), which carries no
+ * appearance or UUID, so a response only fills in a known entry. */
+static void list_add(const bt_addr_le_t *addr, int8_t rssi, uint8_t adv_type, const AdInfo *ai) {
+    struct zmk_ble_mouse_host_scan_result *r = find_result(addr);
+    if (!r) {
+        /* ponytail: first come, first kept; replace the weakest entry if a
+         * crowded room ever fills the list with strangers. */
+        if (adv_type == BT_GAP_ADV_TYPE_SCAN_RSP || !ad_is_hid(ai) ||
+            n_results >= ARRAY_SIZE(results)) {
+            return;
+        }
+        r = &results[n_results++];
+        memset(r, 0, sizeof(*r));
+        bt_addr_le_copy(&r->addr, addr);
+    }
+    r->rssi = rssi;
+    if (ai->appearance) {
+        r->appearance = ai->appearance;
+    }
+    if (ai->name_len && !r->name[0]) {
+        memcpy(r->name, ai->name, sizeof(r->name));
+    }
 }
 
 static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t adv_type,
                     struct net_buf_simple *ad) {
-    if (mouse_conn || connecting) {
+    AdInfo ai;
+    ad_parse(ad->data, ad->len, &ai);
+
+    if (listing) {
+        list_add(addr, rssi, adv_type, &ai);
+    }
+
+    /* The rest is first-match pairing (&mouse_pair), which only runs while
+     * unbonded: reconnect to a known mouse uses direct connect, not scanning
+     * (see mh_begin() / file header). Never match while bonded. */
+    if (mouse_conn || connecting || have_bond || !pairing_requested) {
         return;
     }
 
-    /* Scanning only runs during fresh pairing (which clears any bond first), so
-     * have_bond is false here -- reconnect to a known mouse uses direct connect,
-     * not scanning (see mh_begin() / file header). Guard defensively: never
-     * appearance-match while bonded. */
-    if (have_bond) {
-        return;
-    }
-
-    /* Fresh/initial pairing: broad-match by HID mouse appearance, since we
-     * don't know the mouse's address ahead of time. Directed adverts carry no
-     * AD payload and can't be appearance-matched, so they're intentionally not
-     * accepted here -- a device we've never bonded to has nothing to reconnect
-     * to us for anyway. With pair-name-prefix, match the advertised name instead
-     * (appearance ignored); the name may be in the scan response (active scan). */
+    /* Broad-match, since we don't know the mouse's address ahead of time.
+     * Directed adverts carry no AD payload and can't be appearance-matched,
+     * so they're intentionally not accepted here -- a device we've never
+     * bonded to has nothing to reconnect to us for anyway. With
+     * pair-name-prefix, match the advertised name instead (appearance
+     * ignored); the name may be in the scan response (active scan). */
     bool match = false;
 #if DT_INST_NODE_HAS_PROP(0, pair_name_prefix)
-    if (adv_type != BT_GAP_ADV_TYPE_ADV_IND && adv_type != BT_GAP_ADV_TYPE_SCAN_RSP) {
-        return;
-    }
-    bt_data_parse(ad, is_name_prefix_ad, &match);
+    match = (adv_type == BT_GAP_ADV_TYPE_ADV_IND || adv_type == BT_GAP_ADV_TYPE_SCAN_RSP) &&
+            ai.name_len >= sizeof(PAIR_NAME_PREFIX) - 1 &&
+            memcmp(ai.name, PAIR_NAME_PREFIX, sizeof(PAIR_NAME_PREFIX) - 1) == 0;
 #else
-    if (adv_type != BT_GAP_ADV_TYPE_ADV_IND) {
-        return;
-    }
-    bt_data_parse(ad, is_hid_mouse_ad, &match);
+    match = adv_type == BT_GAP_ADV_TYPE_ADV_IND && ai.appearance == AD_APPEARANCE_HID_MOUSE;
 #endif
     if (!match) {
         return;
@@ -794,6 +900,8 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t adv_type,
     char s[BT_ADDR_LE_STR_LEN];
     bt_addr_le_to_str(addr, s, sizeof(s));
     LOG_INF("found HID device %s (rssi %d), connecting", s, rssi);
+    /* The name may only be in a scan response we never see now; then "". */
+    memcpy(mouse_name, ai.name, sizeof(mouse_name));
     pairing_attempt = true; /* scanning only ever runs during fresh pairing */
     connect_to(addr);
 }
@@ -822,30 +930,26 @@ static void start_scan(void) {
         k_work_reschedule(&scan_retry, K_MSEC(200));
     } else {
         scan_owned = true;
-        LOG_INF("scanning for a HID mouse to pair");
+        LOG_INF("scanning for a HID mouse (%s)", listing ? "list" : "pair");
     }
+    mh_notify();
 }
 
 static void scan_retry_fn(struct k_work *work) {
     ARG_UNUSED(work);
-    if (!mouse_conn && !connecting && mode == MH_SCAN) {
+    /* A list scan may run beside a connected mouse; a pairing scan may not. */
+    if (mode == MH_SCAN && (listing || (!mouse_conn && !connecting))) {
         start_scan();
     }
 }
 
-/* Set by zmk_ble_mouse_host_unpair() to stop reconnect/scan attempts until
- * zmk_ble_mouse_host_pair() is called. */
-static bool mh_paused;
-
-/* Set by the mouse_pair trigger, cleared when that pairing session ends. Gates
- * scanning for a NEW mouse: there is deliberately no automatic scan -- while
- * unbonded, mh_begin() idles until mouse_pair is pressed, so a boot-time scan
- * can't interfere with the split's own peripheral pairing. Reconnecting to an
- * already-bonded mouse is automatic (have_bond branch) and unaffected. */
-static bool pairing_requested;
-
 static void mh_begin(void) {
     if (mouse_conn || connecting) {
+        return;
+    }
+    if (listing) {
+        /* A list scan owns the scanner (initiating would stop it); it calls
+         * mh_begin() again when it ends. */
         return;
     }
     if (mh_paused) {
@@ -861,6 +965,18 @@ static void mh_begin(void) {
         LOG_INF("connecting directly to bonded mouse %s", s);
         pairing_attempt = false; /* reconnect to a known bond, not a fresh pair */
         connect_to(&mouse_addr);
+    } else if (have_target) {
+        /* Pair-by-address: its address came from a list scan, so connect to it
+         * directly. A few tries (it may have left pairing mode), then give up. */
+        if (target_tries++ >= MH_TARGET_TRIES) {
+            LOG_WRN("PAIR: chosen mouse did not pair after %d tries; giving up", MH_TARGET_TRIES);
+            have_target = false;
+            mouse_name[0] = '\0';
+            mh_notify();
+            return;
+        }
+        pairing_attempt = true;
+        connect_to(&target_addr);
     } else if (pairing_requested) {
         /* No bond yet, but the user just pressed mouse_pair: broad-match scan
          * by HID appearance, since we don't know the mouse's address ahead of
@@ -870,6 +986,23 @@ static void mh_begin(void) {
         LOG_INF("no mouse bonded; waiting for a pairing trigger");
     }
 }
+
+/* List scan window over: hand the radio back (a first-match pairing scan that
+ * was already running keeps going) and resume reconnecting. */
+static void list_end_fn(struct k_work *work) {
+    ARG_UNUSED(work);
+    if (!listing) {
+        return;
+    }
+    if (pairing_requested && !have_bond && !mouse_conn) {
+        listing = false;
+        mh_notify();
+    } else {
+        stop_own_scan();
+    }
+    mh_begin();
+}
+static K_WORK_DELAYABLE_DEFINE(list_end, list_end_fn);
 
 /* ---- connection callbacks (shared; filter to our central mouse link) --- */
 
@@ -894,6 +1027,7 @@ static void on_connected(struct bt_conn *conn, uint8_t err) {
         bt_conn_unref(mouse_conn);
         mouse_conn = NULL;
         k_work_reschedule(&mh_retry_work, MH_RETRY_DELAY);
+        mh_notify();
         return;
     }
 
@@ -915,6 +1049,8 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason) {
 
     LOG_INF("mouse disconnected (reason 0x%02x)", reason);
     release_all_buttons();
+    k_work_cancel_delayable(&battery_work);
+    battery = 0xFF;
 #if IS_ENABLED(CONFIG_ZMK_BLE_MOUSE_HOST_FORWARD_KEYS)
     /* Events must not be raised from this (BT) context; the workqueue does it. */
     k_work_submit(&release_keys_work);
@@ -930,16 +1066,23 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason) {
     }
 
     k_work_reschedule(&mh_retry_work, K_NO_WAIT);
+    mh_notify();
 }
 
+/* Also drops a pair-by-address target: every caller either starts a new
+ * pairing (and sets its own target after this) or abandons the current one. */
 static void clear_bond(void) {
     if (have_bond) {
         bt_unpair(BT_ID_DEFAULT, &mouse_addr);
     }
     settings_delete("mouse_host/addr");
+    settings_delete("mouse_host/name");
     have_bond = false;
+    have_target = false;
     memset(&mouse_addr, 0, sizeof(mouse_addr));
+    mouse_name[0] = '\0';
     LOG_INF("cleared stored mouse bond");
+    mh_notify();
 }
 
 void zmk_ble_mouse_host_pair(void) {
@@ -1048,6 +1191,86 @@ void zmk_ble_mouse_host_dump(void) {
     LOG_INF("  subscriptions: %d, protocol: %s", n_subs, use_boot ? "boot" : "report");
 }
 
+void zmk_ble_mouse_host_get_status(struct zmk_ble_mouse_host_status *out) {
+    memset(out, 0, sizeof(*out));
+    if (mouse_conn && !connecting && n_subs > 0) {
+        out->state = ZMK_BLE_MOUSE_HOST_CONNECTED;
+    } else if (mode == MH_SCAN) {
+        out->state = ZMK_BLE_MOUSE_HOST_SCANNING;
+    } else if (!mh_paused && (have_bond || have_target || mouse_conn)) {
+        out->state = ZMK_BLE_MOUSE_HOST_CONNECTING;
+    } else {
+        out->state = ZMK_BLE_MOUSE_HOST_IDLE;
+    }
+    out->bonded = have_bond;
+    out->listing = listing;
+    if (have_bond) {
+        bt_addr_le_copy(&out->addr, &mouse_addr);
+    } else if (have_target) {
+        bt_addr_le_copy(&out->addr, &target_addr);
+    }
+    memcpy(out->name, mouse_name, sizeof(out->name));
+    out->battery = battery;
+    out->buttons = (mouse_conn && layout_valid && layout.buttons.valid) ? layout.buttons.bitSize : 0;
+}
+
+void zmk_ble_mouse_host_scan_start(void) {
+    LOG_INF("PAIR: list scan for %d s", CONFIG_ZMK_BLE_MOUSE_HOST_LIST_SCAN_S);
+    n_results = 0;
+    listing = true;
+    if (connecting && mouse_conn) {
+        /* Cancel a pending reconnect-initiate (the bonded mouse is likely off):
+         * the scanner cannot start beside it. on_connected() sees the cancel,
+         * and mh_begin() waits for the list scan to end. */
+        bt_conn_disconnect(mouse_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+    }
+    k_work_cancel_delayable(&scan_retry);
+    start_scan();
+    k_work_reschedule(&list_end, K_SECONDS(CONFIG_ZMK_BLE_MOUSE_HOST_LIST_SCAN_S));
+}
+
+void zmk_ble_mouse_host_scan_stop(void) { k_work_reschedule(&list_end, K_NO_WAIT); }
+
+int zmk_ble_mouse_host_scan_count(void) { return n_results; }
+
+int zmk_ble_mouse_host_scan_get(int idx, struct zmk_ble_mouse_host_scan_result *out) {
+    if (idx < 0 || idx >= n_results) {
+        return -ENOENT;
+    }
+    *out = results[idx];
+    return 0;
+}
+
+void zmk_ble_mouse_host_pair_addr(const bt_addr_le_t *addr) {
+    char s[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(addr, s, sizeof(s));
+    LOG_INF("PAIR: pairing chosen device %s", s);
+
+    struct zmk_ble_mouse_host_scan_result *r = find_result(addr);
+    bt_addr_le_t a;
+    bt_addr_le_copy(&a, addr); /* addr may point into results[] */
+
+    mh_paused = false;
+    pairing_requested = false; /* not a first-match scan */
+    k_work_cancel_delayable(&list_end);
+    clear_bond();
+    bt_addr_le_copy(&target_addr, &a);
+    have_target = true;
+    target_tries = 0;
+    if (r) {
+        memcpy(mouse_name, r->name, sizeof(mouse_name));
+    }
+    if (mouse_conn) {
+        /* on_disconnected() / on_connected(err) defer to mh_begin(), which
+         * connects to the target. */
+        bt_conn_disconnect(mouse_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+    } else {
+        stop_own_scan(); /* also ends a list scan */
+        mh_begin();
+    }
+    mh_notify();
+}
+
 static void on_security_changed(struct bt_conn *conn, bt_security_t level,
                                 enum bt_security_err err) {
     if (conn != mouse_conn) {
@@ -1094,8 +1317,11 @@ static void on_pairing_complete(struct bt_conn *conn, bool bonded) {
 
     bt_addr_le_copy(&mouse_addr, bt_conn_get_dst(conn));
     have_bond = true;
+    have_target = false;
     pairing_requested = false; /* pairing session complete; back to reconnect-only */
     int err = settings_save_one("mouse_host/addr", &mouse_addr, sizeof(mouse_addr));
+    settings_save_one("mouse_host/name", mouse_name, strlen(mouse_name));
+    mh_notify();
 
     char s[BT_ADDR_LE_STR_LEN];
     bt_addr_le_to_str(&mouse_addr, s, sizeof(s));

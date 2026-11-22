@@ -11,6 +11,8 @@ test: | $(BUILD)
 	./$(BUILD)/test_hid
 	$(CC) $(CFLAGS) test_key_diff.c ../src/key_diff.c ../src/hid_parser.c -o $(BUILD)/test_key_diff
 	./$(BUILD)/test_key_diff
+	$(CC) $(CFLAGS) test_ad_parse.c ../src/ad_parse.c -o $(BUILD)/test_ad_parse
+	./$(BUILD)/test_ad_parse
 
 $(BUILD):
 	mkdir -p $(BUILD)
