@@ -518,6 +518,11 @@ static uint8_t read_map_cb(struct bt_conn *conn, uint8_t err,
 #endif
     if (layout_valid) {
         mouse_report_len = layout_report_len(&layout);
+        if (layout.buttons.valid && layout.buttons.bitSize > 8) {
+            /* emit_motion() forwards buttons 1-8 only (INPUT_BTN_0..7). */
+            LOG_WRN("report map has %u buttons; only buttons 1-8 are forwarded",
+                    layout.buttons.bitSize);
+        }
         LOG_INF("layout: rid=%d len=%uB X(off%u sz%u) Y(off%u sz%u) wheel=%s pan=%s btn(off%u n%u)",
                 layout.mouseReportId, mouse_report_len, layout.x.bitOffset, layout.x.bitSize,
                 layout.y.bitOffset, layout.y.bitSize, layout.wheel.valid ? "y" : "n",
@@ -1211,7 +1216,10 @@ void zmk_ble_mouse_host_get_status(struct zmk_ble_mouse_host_status *out) {
     }
     memcpy(out->name, mouse_name, sizeof(out->name));
     out->battery = battery;
-    out->buttons = (mouse_conn && layout_valid && layout.buttons.valid) ? layout.buttons.bitSize : 0;
+    bool parsed = mouse_conn && layout_valid;
+    out->buttons = (parsed && layout.buttons.valid) ? layout.buttons.bitSize : 0;
+    out->wheel = parsed && layout.wheel.valid;
+    out->pan = parsed && layout.hwheel.valid;
 }
 
 void zmk_ble_mouse_host_scan_start(void) {

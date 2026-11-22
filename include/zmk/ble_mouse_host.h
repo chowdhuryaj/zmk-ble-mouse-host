@@ -63,7 +63,9 @@ struct zmk_ble_mouse_host_status {
     bt_addr_le_t addr; /* bonded mouse, else the pairing target; zero if none */
     char name[ZMK_BLE_MOUSE_HOST_NAME_MAX + 1]; /* from its advertising; "" if unknown */
     uint8_t battery;   /* BAS level 0-100, 0xFF = unknown / no BAS */
-    uint8_t buttons;   /* buttons in its report map, 0 = unknown */
+    uint8_t buttons;   /* buttons in its report map, 0 = unknown (more than 8: only 1-8 forwarded) */
+    bool wheel;        /* report map has a vertical wheel (unknown = false) */
+    bool pan;          /* report map has AC Pan, i.e. a tilt / horizontal wheel */
 };
 
 void zmk_ble_mouse_host_get_status(struct zmk_ble_mouse_host_status *out);
