@@ -239,8 +239,11 @@ are not decoded.
 ## Known limitations
 
 - **One mouse at a time.** Only a single external mouse is tracked.
-- **Buttons.** Up to 5 buttons are forwarded (left / right / middle / back /
-  forward), matching ZMK's mouse HID.
+- **Buttons.** Up to 8 buttons are emitted as `INPUT_BTN_0`..`INPUT_BTN_7`.
+  ZMK's mouse HID carries only the first 5 (left / right / middle / back /
+  forward); the listener ignores 6-8. Map them to keys with a
+  `zmk,input-processor-behaviors` on the listener, e.g.
+  `codes = <INPUT_BTN_5 INPUT_BTN_6 INPUT_BTN_7>; bindings = <&kp F13 &kp F14 &kp F15>;`.
 - **Discovery on fresh pairing needs a GAP *Mouse* appearance** (`0x03C2`),
   unless `pair-name-prefix` is set (then the advertised name is matched instead).
   A device that does neither won't be found by `&mouse_pair`.

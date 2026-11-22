@@ -170,7 +170,7 @@ static void emit_motion(int dx, int dy, int wheel, int pan, uint8_t buttons) {
     }
     uint8_t changed = buttons ^ prev_buttons;
     int n = (dx ? 1 : 0) + (dy ? 1 : 0) + (wheel ? 1 : 0) + (pan ? 1 : 0);
-    for (int b = 0; b < 5; b++) {
+    for (int b = 0; b < 8; b++) {
         if (changed & BIT(b)) {
             n++;
         }
@@ -181,6 +181,15 @@ static void emit_motion(int dx, int dy, int wheel, int pan, uint8_t buttons) {
 
     int e = 0;
 #define SYNC (++e == n)
+    /* Buttons first, highest first: buttons 6-8 (INPUT_BTN_5..7) are not in
+     * ZMK's mouse HID and are usually consumed by a zmk,input-processor-behaviors
+     * on the listener (which stops the event, sync flag included). Emitting
+     * them first puts the sync on a forwarded event whenever there is one. */
+    for (int b = 7; b >= 0; b--) {
+        if (changed & BIT(b)) {
+            input_report_key(mh_dev, INPUT_BTN_0 + b, (buttons >> b) & 1, SYNC, K_NO_WAIT);
+        }
+    }
     if (dx) {
         input_report_rel(mh_dev, INPUT_REL_X, dx, SYNC, K_NO_WAIT);
     }
@@ -192,11 +201,6 @@ static void emit_motion(int dx, int dy, int wheel, int pan, uint8_t buttons) {
     }
     if (pan) {
         input_report_rel(mh_dev, INPUT_REL_HWHEEL, pan, SYNC, K_NO_WAIT);
-    }
-    for (int b = 0; b < 5; b++) {
-        if (changed & BIT(b)) {
-            input_report_key(mh_dev, INPUT_BTN_0 + b, (buttons >> b) & 1, SYNC, K_NO_WAIT);
-        }
     }
 #undef SYNC
     prev_buttons = buttons;
