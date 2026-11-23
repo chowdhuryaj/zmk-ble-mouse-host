@@ -140,6 +140,19 @@ static bool mh_paused;
  * already-bonded mouse is automatic (have_bond branch) and unaffected. */
 static bool pairing_requested;
 
+/* Last pairing / connection failure, for the Flask status (no console on
+ * the locked-down dongle). Overwritten by each new failure, never cleared. */
+static struct zmk_ble_mouse_host_error last_error;
+
+void zmk_ble_mouse_host_set_error(uint8_t phase, uint8_t code, uint8_t code2) {
+    last_error = (struct zmk_ble_mouse_host_error){
+        .phase = phase, .code = code, .code2 = code2, .at_ms = k_uptime_get()};
+}
+
+void zmk_ble_mouse_host_get_error(struct zmk_ble_mouse_host_error *out) { *out = last_error; }
+
+#define MH_ERR(phase, code, code2) zmk_ble_mouse_host_set_error(phase, (uint8_t)(code), code2)
+
 /* List scan (zmk_ble_mouse_host_scan_start): collects, never connects. */
 static bool listing;
 static struct zmk_ble_mouse_host_scan_result results[CONFIG_ZMK_BLE_MOUSE_HOST_LIST_SIZE];
@@ -540,8 +553,15 @@ static uint8_t read_map_cb(struct bt_conn *conn, uint8_t err,
     }
 
     LOG_HEXDUMP_INF(report_map, report_map_len, "HID report map");
+    if (err) {
+        MH_ERR(ZMK_BLE_MOUSE_HOST_ERR_REPORT_MAP, err, 0);
+    }
     hid_parse_mouse(report_map, report_map_len, &layout);
     layout_valid = layout.x.valid;
+    if (!err && !layout_valid) {
+        /* code2 1: read fine but no X/Y found (boot-layout fallback). */
+        MH_ERR(ZMK_BLE_MOUSE_HOST_ERR_REPORT_MAP, 0, 1);
+    }
 #if IS_ENABLED(CONFIG_ZMK_BLE_MOUSE_HOST_FORWARD_KEYS)
     hid_parse_keys(report_map, report_map_len, &kb_layout, &cc_layout);
     LOG_INF("keys: keyboard=%s (rid %d, %s, mods=%s) consumer=%s (rid %d, %ux%u-bit)",
@@ -622,6 +642,7 @@ static void do_subscribe(struct bt_conn *conn, uint16_t value_handle, int idx) {
     int err = bt_gatt_subscribe(conn, &sub[idx]);
     if (err && err != -EALREADY) {
         LOG_ERR("subscribe (handle %u) failed (err %d)", value_handle, err);
+        MH_ERR(ZMK_BLE_MOUSE_HOST_ERR_SUBSCRIBE, -err, idx);
     } else {
         LOG_INF("subscribed to input report (handle %u)", value_handle);
     }
@@ -709,6 +730,7 @@ static void subscribe_phase(struct bt_conn *conn) {
         int err = bt_gatt_read(conn, &map_read);
         if (err) {
             LOG_ERR("report map read failed (err %d); subscribing with boot fallback", err);
+            MH_ERR(ZMK_BLE_MOUSE_HOST_ERR_REPORT_MAP, -err, 2);
             do_subscribes(conn);
         }
     } else {
@@ -763,6 +785,7 @@ static uint8_t disc_service_cb(struct bt_conn *conn, const struct bt_gatt_attr *
              * mh_begin() then idles until the user triggers pairing again
              * (clear_bond() also drops a pair-by-address target). */
             LOG_WRN("pairing target has no HID service; not a mouse -- dropping it");
+            MH_ERR(ZMK_BLE_MOUSE_HOST_ERR_NO_HID, 0, 0);
             bt_addr_le_t peer;
             bt_addr_le_copy(&peer, bt_conn_get_dst(conn));
             attempt_failed(&peer);
@@ -851,6 +874,7 @@ static void start_discovery(struct bt_conn *conn) {
         }
         retry_count = 0;
         LOG_ERR("service discovery failed (err %d)", err);
+        MH_ERR(ZMK_BLE_MOUSE_HOST_ERR_NO_HID, -err, 1);
         return;
     }
     retry_count = 0;
@@ -877,6 +901,9 @@ static void connect_to(const bt_addr_le_t *addr) {
     int err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN, MH_CONN_PARAM, &mouse_conn);
     if (err) {
         LOG_ERR("create connection failed (err %d)", err);
+        if (pairing_attempt) {
+            MH_ERR(ZMK_BLE_MOUSE_HOST_ERR_CREATE, -err, 1);
+        }
         connecting = false;
         /* -EALREADY: ZMK's split central is initiating. Back off so it can finish. */
         k_work_reschedule(&mh_retry_work, MH_RETRY_DELAY);
@@ -1029,6 +1056,7 @@ static void mh_begin(void) {
          * directly. A few tries (it may have left pairing mode), then give up. */
         if (target_tries++ >= MH_TARGET_TRIES) {
             LOG_WRN("PAIR: chosen mouse did not pair after %d tries; giving up", MH_TARGET_TRIES);
+            MH_ERR(ZMK_BLE_MOUSE_HOST_ERR_TIMEOUT, 1, MH_TARGET_TRIES);
             bt_addr_le_t peer;
             bt_addr_le_copy(&peer, &target_addr);
             attempt_failed(&peer);
@@ -1083,6 +1111,9 @@ static void on_connected(struct bt_conn *conn, uint8_t err) {
 
     if (err) {
         LOG_ERR("mouse connection failed (err 0x%02x)", err);
+        if (pairing_attempt) {
+            MH_ERR(ZMK_BLE_MOUSE_HOST_ERR_CONNECT, err, 1);
+        }
         bt_conn_unref(mouse_conn);
         mouse_conn = NULL;
         k_work_reschedule(&mh_retry_work, MH_RETRY_DELAY);
@@ -1107,6 +1138,10 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason) {
     }
 
     LOG_INF("mouse disconnected (reason 0x%02x)", reason);
+    if (pairing_attempt && bt_conn_get_security(conn) < BT_SECURITY_L2) {
+        /* code2 2: link dropped before encryption (vs 1/0 = create failed). */
+        MH_ERR(ZMK_BLE_MOUSE_HOST_ERR_CONNECT, reason, 2);
+    }
     k_work_submit(&release_work);
     k_work_cancel_delayable(&battery_work);
     battery = 0xFF;
@@ -1205,6 +1240,7 @@ static void pair_timeout_fn(struct k_work *work) {
         return;
     }
     LOG_WRN("PAIR: no mouse paired within %d s; giving up", CONFIG_ZMK_BLE_MOUSE_HOST_PAIR_TIMEOUT_S);
+    MH_ERR(ZMK_BLE_MOUSE_HOST_ERR_TIMEOUT, 2, 0);
     if (!listing) {
         stop_own_scan();
     }
@@ -1446,6 +1482,8 @@ static void on_security_changed(struct bt_conn *conn, bt_security_t level,
         return;
     }
     if (err) {
+        /* code2 1: during a fresh pairing, 0: on the bonded mouse. */
+        MH_ERR(ZMK_BLE_MOUSE_HOST_ERR_SECURITY, err, pairing_attempt && !have_bond);
         /* The peer rejected our keys -- typically because its pairing was
          * removed on its side. Drop the stale bond and re-pair from scratch.
          * Defense in depth: only clear the stored bond if this connection is

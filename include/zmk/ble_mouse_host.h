@@ -105,6 +105,40 @@ int zmk_ble_mouse_host_scan_get(int idx, struct zmk_ble_mouse_host_scan_result *
  * back (bonded true again), or the state goes IDLE if there was none. */
 void zmk_ble_mouse_host_pair_addr(const bt_addr_le_t *addr);
 
+/* Last pairing / connection failure (diagnostics; overwritten by the next
+ * one, never cleared). phase 0 = none yet. code / code2 per phase:
+ * Phases 1-2 are recorded only during a pairing attempt, so reconnects to an
+ * absent bonded mouse don't overwrite a pairing failure.
+ *   1 CREATE      bt_conn_le_create failed: code -errno, code2 1
+ *   2 CONNECT     code HCI reason; code2 1 = connection failed to establish,
+ *                 2 = disconnected before encryption
+ *   3 SECURITY    code enum bt_security_err; code2 1 = fresh pairing
+ *   4 NO_HID      code2 0 = no HID service; 1 = discovery failed, code -errno
+ *   5 REPORT_MAP  code ATT error (code2 0), -errno of the read (code2 2), or
+ *                 code2 1 = read fine but no X/Y (boot-layout fallback)
+ *   6 SUBSCRIBE   code -errno, code2 subscription index
+ *   7 TIMEOUT     code 1 = pair by address gave up (code2 tries), 2 = first match
+ *   8 ADDR_CHECK  set by the configurator: pair request's address did not match */
+enum zmk_ble_mouse_host_err_phase {
+    ZMK_BLE_MOUSE_HOST_ERR_NONE = 0,
+    ZMK_BLE_MOUSE_HOST_ERR_CREATE = 1,
+    ZMK_BLE_MOUSE_HOST_ERR_CONNECT = 2,
+    ZMK_BLE_MOUSE_HOST_ERR_SECURITY = 3,
+    ZMK_BLE_MOUSE_HOST_ERR_NO_HID = 4,
+    ZMK_BLE_MOUSE_HOST_ERR_REPORT_MAP = 5,
+    ZMK_BLE_MOUSE_HOST_ERR_SUBSCRIBE = 6,
+    ZMK_BLE_MOUSE_HOST_ERR_TIMEOUT = 7,
+    ZMK_BLE_MOUSE_HOST_ERR_ADDR_CHECK = 8,
+};
+
+struct zmk_ble_mouse_host_error {
+    uint8_t phase, code, code2;
+    int64_t at_ms; /* k_uptime_get() when recorded */
+};
+
+void zmk_ble_mouse_host_get_error(struct zmk_ble_mouse_host_error *out);
+void zmk_ble_mouse_host_set_error(uint8_t phase, uint8_t code, uint8_t code2);
+
 /* Raised (from the system workqueue) whenever anything in the status may have
  * changed; read zmk_ble_mouse_host_get_status() for the new values. */
 struct zmk_ble_mouse_host_state_changed {
